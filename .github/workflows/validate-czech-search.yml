@@ -1,0 +1,97 @@
+name: Validate Czech search review revision
+on:
+  push:
+    branches: [validation/search490-nov3]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      SOURCE_SHA: 2d89a0baab8c59800b0eba6fa59ce8bf8311329a
+      ELASTICSEARCH_URL: http://localhost:9200
+      REDIS_HOST: localhost
+      REDIS_PORT: '6379'
+      CONFIG_PATH: tests/int/data/test_off.yml
+      TAXONOMY_CACHE_DIR: /tmp/search490-taxonomies
+      POETRY_VIRTUALENVS_IN_PROJECT: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install locked dependencies
+        run: |
+          python -m pip install poetry==2.3.2
+          poetry check --lock
+          poetry install --with dev --no-root
+          sudo ln -s "$PWD" /opt/search
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/source-sha.txt
+          git diff 290ef542c9366ad690b9e313b0bf5060ab8afda2 -- app/config.py tests/unit/data/test_mapping.json tests/int/test_analyze.py tests/unit/test_indexing.py > evidence/contribution.diff
+      - name: Start disposable Elasticsearch 8.19.0 and Redis
+        run: |
+          sudo sysctl -w vm.max_map_count=1048576
+          docker network create search490
+          for node in es01 es02; do
+            port=9200
+            if [ "$node" = es02 ]; then port=9201; fi
+            docker run -d --name "$node" --network search490 -p "$port:9200" \
+              -e cluster.name=search490 -e node.name="$node" \
+              -e discovery.seed_hosts=es01,es02 -e cluster.initial_master_nodes=es01,es02 \
+              -e xpack.security.enabled=false -e 'ES_JAVA_OPTS=-Xms512m -Xmx512m' \
+              docker.elastic.co/elasticsearch/elasticsearch:8.19.0
+          done
+          docker run -d --name search490-redis -p 6379:6379 redis:7.4.2
+          for attempt in $(seq 1 90); do
+            if curl -fsS 'http://localhost:9200/_cluster/health?wait_for_status=green&wait_for_nodes=2&timeout=1s' > evidence/cluster-health.json; then
+              python -c 'import json; d=json.load(open("evidence/cluster-health.json")); assert d["status"] == "green" and d["number_of_nodes"] == 2' && break
+            fi
+            sleep 2
+          done
+          python -c 'import json; d=json.load(open("evidence/cluster-health.json")); assert d["status"] == "green" and d["number_of_nodes"] == 2'
+      - name: Demonstrate regression on latest upstream analyzer mapping
+        run: |
+          cp app/config.py evidence/fixed-config.py
+          git show 290ef542c9366ad690b9e313b0bf5060ab8afda2:app/config.py > app/config.py
+          set +e
+          poetry run pytest tests/int/test_analyze.py::test_czech_text_search -q --junitxml=evidence/baseline.xml > evidence/baseline.log 2>&1
+          status=$?
+          set -e
+          cp evidence/fixed-config.py app/config.py
+          cat evidence/baseline.log
+          test "$status" = 1
+          python - <<'PYCODE'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('evidence/baseline.xml').getroot()
+          cases = root.findall('.//testcase')
+          assert len(cases) == 1
+          assert not root.findall('.//error')
+          failures = root.findall('.//failure')
+          assert len(failures) == 1
+          assert "assert [] == ['apples']" in failures[0].text
+          PYCODE
+      - name: Verify fixed behavior and full backend suites
+        run: |
+          poetry run pytest tests/int/test_analyze.py::test_czech_text_search -q --junitxml=evidence/focused.xml | tee evidence/focused.log
+          poetry run pytest tests/unit -q --junitxml=evidence/unit.xml | tee evidence/unit.log
+          poetry run pytest tests/int -q --clean-es --junitxml=evidence/integration.xml | tee evidence/integration.log
+          poetry run pre-commit run --files app/config.py tests/unit/data/test_mapping.json tests/unit/test_indexing.py tests/int/test_analyze.py | tee evidence/precommit.log
+          git diff --exit-code
+          git diff --check
+      - name: Retain real service logs
+        if: always()
+        run: |
+          mkdir -p evidence
+          docker logs es01 > evidence/es01.log 2>&1 || true
+          docker logs es02 > evidence/es02.log 2>&1 || true
+          docker logs search490-redis > evidence/redis.log 2>&1 || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: search490-real-elasticsearch-validation
+          path: evidence/
