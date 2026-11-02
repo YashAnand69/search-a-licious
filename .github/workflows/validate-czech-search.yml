@@ -31,6 +31,7 @@ jobs:
           poetry install --with dev --no-root
           sudo ln -s "$PWD" /opt/search
           mkdir -p evidence
+          git fetch https://github.com/openfoodfacts/search-a-licious.git 290ef542c9366ad690b9e313b0bf5060ab8afda2
           git rev-parse HEAD > evidence/source-sha.txt
           git diff 290ef542c9366ad690b9e313b0bf5060ab8afda2 -- app/config.py tests/unit/data/test_mapping.json tests/int/test_analyze.py tests/unit/test_indexing.py > evidence/contribution.diff
       - name: Start disposable Elasticsearch 8.19.0 and Redis
