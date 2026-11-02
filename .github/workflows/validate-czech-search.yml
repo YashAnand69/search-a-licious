@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      SOURCE_SHA: 2d89a0baab8c59800b0eba6fa59ce8bf8311329a
+      SOURCE_SHA: 1480700575bec22cdd1f556911423de1b160adb1
       ELASTICSEARCH_URL: http://localhost:9200
       REDIS_HOST: localhost
       REDIS_PORT: '6379'
@@ -78,6 +78,15 @@ jobs:
           PYCODE
       - name: Verify fixed behavior and full backend suites
         run: |
+          curl -fsS -X PUT 'http://localhost:9200/test_czech_text_search' -H 'Content-Type: application/json' -d '{"settings":{"number_of_replicas":0}}'
+          poetry run pytest tests/int/test_analyze.py::test_czech_text_search -q --junitxml=evidence/stale-index-control.xml | tee evidence/stale-index-control.log
+          poetry run python - <<'PYCODE'
+          from elasticsearch import Elasticsearch
+          es = Elasticsearch("http://localhost:9200")
+          indices = es.indices.get(index="test_czech_text_search*")
+          assert set(indices) == {"test_czech_text_search"}, indices
+          es.indices.delete(index="test_czech_text_search")
+          PYCODE
           poetry run pytest tests/int/test_analyze.py::test_czech_text_search -q --junitxml=evidence/focused.xml | tee evidence/focused.log
           poetry run pytest tests/unit -q --junitxml=evidence/unit.xml | tee evidence/unit.log
           poetry run pytest tests/int -q --clean-es --junitxml=evidence/integration.xml | tee evidence/integration.log
